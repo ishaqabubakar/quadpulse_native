@@ -11,6 +11,7 @@ import 'package:url_launcher/url_launcher.dart';
 final WebUri quadPulseHomeUrl = WebUri('https://quadpulse.io/home');
 final WebUri mobileAuthCompleteUrl =
     WebUri('https://quadpulse.io/auth/mobile/complete');
+final Uri quadPulseBaseUri = Uri.parse('https://quadpulse.io');
 const Set<String> inAppHosts = {'quadpulse.io', 'www.quadpulse.io'};
 const Set<String> externalHosts = {
   'facebook.com',
@@ -530,16 +531,45 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
   }
 
   String _safeQuadPulseReturnUrl(String? value) {
-    if (value == null || value.isEmpty) {
+    final cleaned = value?.trim();
+    if (cleaned == null || cleaned.isEmpty) {
       return quadPulseHomeUrl.toString();
     }
 
-    final parsed = WebUri(value);
+    final uri = Uri.tryParse(cleaned);
+    if (uri == null) return quadPulseHomeUrl.toString();
+
+    if (cleaned.startsWith('/') && !cleaned.startsWith('//')) {
+      return _quadPulseUrlFromPath(uri).toString();
+    }
+
+    final parsed = WebUri.uri(uri);
     if (_isQuadPulseUrl(parsed)) {
-      return parsed.toString();
+      return uri.toString();
+    }
+
+    if (_isLocalhostUri(uri)) {
+      return _quadPulseUrlFromPath(uri).toString();
     }
 
     return quadPulseHomeUrl.toString();
+  }
+
+  bool _isLocalhostUri(Uri uri) {
+    final host = uri.host.toLowerCase();
+    return host == 'localhost' ||
+        host == '127.0.0.1' ||
+        host == '0.0.0.0' ||
+        host == '::1' ||
+        host == '[::1]';
+  }
+
+  Uri _quadPulseUrlFromPath(Uri uri) {
+    return quadPulseBaseUri.replace(
+      path: uri.path.isEmpty ? '/' : uri.path,
+      query: uri.hasQuery ? uri.query : null,
+      fragment: uri.hasFragment ? uri.fragment : null,
+    );
   }
 
   bool _looksLikeAuthFlow(WebUri url) {
