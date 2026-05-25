@@ -184,14 +184,16 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                   onLoadStop: (_, __) {
                     if (mounted) setState(() => _progress = 1);
                   },
-                  shouldOverrideUrlLoading: (controller, navigationAction) async {
+                  shouldOverrideUrlLoading:
+                      (controller, navigationAction) async {
                     final requestedUrl = navigationAction.request.url;
                     if (requestedUrl == null) {
                       return NavigationActionPolicy.ALLOW;
                     }
                     final url = _canonicalQuadPulseWebUrl(requestedUrl);
                     if (url.toString() != requestedUrl.toString()) {
-                      await controller.loadUrl(urlRequest: URLRequest(url: url));
+                      await controller.loadUrl(
+                          urlRequest: URLRequest(url: url));
                       return NavigationActionPolicy.CANCEL;
                     }
                     if (_shouldOpenInSystemAuthSession(url)) {
@@ -566,7 +568,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
     if (uri == null) return url;
 
     final originalCallback = uri.queryParameters['callbackUrl'];
-    final returnUrl = _safeQuadPulseReturnUrl(originalCallback);
+    final returnUrl = _safeQuadPulseDashboardReturnUrl(originalCallback);
     final mobileCallback = Uri.parse(mobileAuthCompleteUrl.toString())
         .replace(queryParameters: {'returnUrl': returnUrl}).toString();
 
@@ -577,6 +579,38 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
       ..['callbackUrl'] = mobileCallback;
 
     return WebUri.uri(uri.replace(queryParameters: query));
+  }
+
+  String _safeQuadPulseDashboardReturnUrl(String? value) {
+    final mobileReturnUrl = _returnUrlFromMobileAuthCallback(value);
+    final url = _safeQuadPulseReturnUrl(mobileReturnUrl ?? value);
+    final uri = Uri.tryParse(url);
+    if (uri == null) return quadPulseHomeUrl.toString();
+
+    final path = uri.path.toLowerCase();
+    if (path.startsWith('/auth/') || path.startsWith('/api/auth/')) {
+      return quadPulseHomeUrl.toString();
+    }
+
+    return url;
+  }
+
+  String? _returnUrlFromMobileAuthCallback(String? value) {
+    final cleaned = value?.trim();
+    if (cleaned == null || cleaned.isEmpty) return null;
+
+    final uri = Uri.tryParse(cleaned);
+    if (uri == null) return null;
+
+    final isRelativeMobileCallback = cleaned.startsWith('/') &&
+        !cleaned.startsWith('//') &&
+        uri.path == mobileAuthCompleteUrl.path;
+    final isAbsoluteMobileCallback = _isQuadPulseUrl(WebUri.uri(uri)) &&
+        uri.path == mobileAuthCompleteUrl.path;
+    if (!isRelativeMobileCallback && !isAbsoluteMobileCallback) return null;
+
+    final returnUrl = uri.queryParameters['returnUrl']?.trim();
+    return returnUrl == null || returnUrl.isEmpty ? null : returnUrl;
   }
 
   String _safeQuadPulseReturnUrl(String? value) {
