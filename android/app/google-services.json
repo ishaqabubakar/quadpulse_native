@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "819226462859",
+    "project_id": "quadpulse-4930d",
+    "storage_bucket": "quadpulse-4930d.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:819226462859:android:94f93b4c2e7ab5492e628e",
+        "android_client_info": {
+          "package_name": "io.quadpulse.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAXx5JWXQqhvLBri8ee0OFZnzP4jHI19-s"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

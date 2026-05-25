@@ -1,17 +1,31 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:app_links/app_links.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 final WebUri quadPulseHomeUrl = WebUri('https://quadpulse.io/home');
+final WebUri quadPulseCookieUrl = WebUri('https://quadpulse.io');
 final WebUri mobileAuthCompleteUrl =
     WebUri('https://quadpulse.io/auth/mobile/complete');
 final Uri quadPulseBaseUri = Uri.parse('https://quadpulse.io');
+const String defaultMobileAuthReturnPath = '/dashboard';
+const String androidUserAgentSuffix = 'QuadPulse-AndroidNative';
+const String legacyWebNativeUserAgentSuffix = 'QuadPulse-WebNative';
+const String pushDeviceIdKey = 'quadpulse.push.device_id';
+const String pushAlertsChannelId = 'quadpulse_alerts';
+const String pushAlertsChannelName = 'QuadPulse alerts';
 const Set<String> inAppHosts = {'quadpulse.io', 'www.quadpulse.io'};
 const Set<String> externalHosts = {
   'facebook.com',
@@ -33,6 +47,25 @@ const Set<String> externalHosts = {
   'www.whatsapp.com',
 };
 
+final FlutterLocalNotificationsPlugin localNotifications =
+    FlutterLocalNotificationsPlugin();
+bool firebaseMessagingAvailable = false;
+
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await _initializeFirebaseMessaging();
+}
+
+Future<void> _initializeFirebaseMessaging() async {
+  if (firebaseMessagingAvailable) return;
+  try {
+    await Firebase.initializeApp();
+    firebaseMessagingAvailable = true;
+  } catch (error) {
+    debugPrint('QuadPulse push: Firebase is not configured yet: $error');
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -53,6 +86,11 @@ Future<void> main() async {
 
   if (Platform.isAndroid) {
     await InAppWebViewController.setWebContentsDebuggingEnabled(false);
+  }
+
+  await _initializeFirebaseMessaging();
+  if (firebaseMessagingAvailable) {
+    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
   }
 
   runApp(const QuadPulseApp());
@@ -85,19 +123,30 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
   StreamSubscription<Uri>? _linkSubscription;
   WebAuthenticationSession? _authSession;
   WebUri? _pendingDeepLink;
+  WebUri? _pendingConsumeCookieCheckUrl;
   int? _popupWindowId;
   DateTime? _lastBackPressAt;
+  StreamSubscription<String>? _pushTokenSubscription;
+  StreamSubscription<RemoteMessage>? _foregroundPushSubscription;
+  StreamSubscription<RemoteMessage>? _pushOpenSubscription;
+  String? _lastRegisteredPushToken;
+  bool _pushInitialized = false;
+  bool _pushRegistrationInFlight = false;
   double _progress = 0;
 
   @override
   void initState() {
     super.initState();
     _initDeepLinks();
+    _initPushNotifications();
   }
 
   @override
   void dispose() {
     _linkSubscription?.cancel();
+    _pushTokenSubscription?.cancel();
+    _foregroundPushSubscription?.cancel();
+    _pushOpenSubscription?.cancel();
     _authBrowser.dispose();
     _authSession?.dispose();
     super.dispose();
@@ -151,18 +200,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
               Positioned.fill(
                 child: InAppWebView(
                   initialUrlRequest: URLRequest(url: quadPulseHomeUrl),
-                  initialSettings: InAppWebViewSettings(
-                    allowsBackForwardNavigationGestures: true,
-                    allowsInlineMediaPlayback: true,
-                    applicationNameForUserAgent: 'QuadPulse-WebNative',
-                    geolocationEnabled: true,
-                    javaScriptCanOpenWindowsAutomatically: true,
-                    javaScriptEnabled: true,
-                    mediaPlaybackRequiresUserGesture: false,
-                    supportMultipleWindows: true,
-                    transparentBackground: false,
-                    useShouldOverrideUrlLoading: true,
-                  ),
+                  initialSettings: _mainWebViewSettings(),
                   onWebViewCreated: (controller) {
                     _controller = controller;
                     _loadPendingDeepLink();
@@ -176,13 +214,18 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                     if (url == null) return;
 
                     final canonicalUrl = _canonicalQuadPulseWebUrl(url);
+                    if (_isLogoutUrl(canonicalUrl)) {
+                      await _unregisterPushTokenWithWebSession();
+                    }
                     if (canonicalUrl.toString() == url.toString()) return;
 
                     await controller.stopLoading();
                     await _loadInMainWebView(canonicalUrl);
                   },
-                  onLoadStop: (_, __) {
+                  onLoadStop: (controller, url) async {
                     if (mounted) setState(() => _progress = 1);
+                    await _maybeLogAuthConsumeResult(controller, url);
+                    await _registerPushTokenIfAuthenticated(url);
                   },
                   shouldOverrideUrlLoading:
                       (controller, navigationAction) async {
@@ -268,14 +311,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                       children: [
                         InAppWebView(
                           windowId: _popupWindowId,
-                          initialSettings: InAppWebViewSettings(
-                            applicationNameForUserAgent: 'QuadPulse-WebNative',
-                            javaScriptCanOpenWindowsAutomatically: true,
-                            javaScriptEnabled: true,
-                            mediaPlaybackRequiresUserGesture: false,
-                            supportMultipleWindows: true,
-                            useShouldOverrideUrlLoading: true,
-                          ),
+                          initialSettings: _popupWebViewSettings(),
                           onCloseWindow: (_) {
                             if (mounted) {
                               setState(() => _popupWindowId = null);
@@ -358,6 +394,46 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
     );
   }
 
+  InAppWebViewSettings _mainWebViewSettings() {
+    return InAppWebViewSettings(
+      allowsBackForwardNavigationGestures: true,
+      allowsInlineMediaPlayback: true,
+      applicationNameForUserAgent: _nativeUserAgentSuffix,
+      domStorageEnabled: true,
+      geolocationEnabled: true,
+      incognito: false,
+      javaScriptCanOpenWindowsAutomatically: true,
+      javaScriptEnabled: true,
+      mediaPlaybackRequiresUserGesture: false,
+      sharedCookiesEnabled: true,
+      supportMultipleWindows: true,
+      thirdPartyCookiesEnabled: true,
+      transparentBackground: false,
+      useShouldOverrideUrlLoading: true,
+    );
+  }
+
+  InAppWebViewSettings _popupWebViewSettings() {
+    return InAppWebViewSettings(
+      applicationNameForUserAgent: _nativeUserAgentSuffix,
+      domStorageEnabled: true,
+      incognito: false,
+      javaScriptCanOpenWindowsAutomatically: true,
+      javaScriptEnabled: true,
+      mediaPlaybackRequiresUserGesture: false,
+      sharedCookiesEnabled: true,
+      supportMultipleWindows: true,
+      thirdPartyCookiesEnabled: true,
+      useShouldOverrideUrlLoading: true,
+    );
+  }
+
+  String get _nativeUserAgentSuffix {
+    return Platform.isAndroid
+        ? androidUserAgentSuffix
+        : legacyWebNativeUserAgentSuffix;
+  }
+
   Future<void> _initDeepLinks() async {
     _linkSubscription = _appLinks.uriLinkStream.listen(
       _openDeepLink,
@@ -374,9 +450,227 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
     }
   }
 
+  Future<void> _initPushNotifications() async {
+    if (!firebaseMessagingAvailable) return;
+
+    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const iosInit = DarwinInitializationSettings(
+      requestAlertPermission: false,
+      requestBadgePermission: false,
+      requestSoundPermission: false,
+    );
+    const initSettings = InitializationSettings(
+      android: androidInit,
+      iOS: iosInit,
+    );
+    await localNotifications.initialize(
+      initSettings,
+      onDidReceiveNotificationResponse: (response) {
+        final payload = response.payload;
+        if (payload == null || payload.isEmpty) return;
+        final uri = Uri.tryParse(payload);
+        if (uri != null) _openPushHref(uri.toString());
+      },
+    );
+
+    const androidChannel = AndroidNotificationChannel(
+      pushAlertsChannelId,
+      pushAlertsChannelName,
+      description: 'Native QuadPulse trading and account alerts.',
+      importance: Importance.high,
+    );
+    await localNotifications
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.createNotificationChannel(androidChannel);
+
+    await FirebaseMessaging.instance
+        .setForegroundNotificationPresentationOptions(
+      alert: true,
+      badge: true,
+      sound: true,
+    );
+
+    _foregroundPushSubscription = FirebaseMessaging.onMessage.listen(
+      _showForegroundPushNotification,
+    );
+    _pushOpenSubscription = FirebaseMessaging.onMessageOpenedApp.listen(
+      (message) => _openPushHref(message.data['href']?.toString()),
+    );
+    _pushTokenSubscription = FirebaseMessaging.instance.onTokenRefresh.listen(
+      (token) => _registerPushTokenWithWebSession(token),
+    );
+
+    final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
+    final initialHref = initialMessage?.data['href']?.toString();
+    if (initialHref != null && initialHref.isNotEmpty) {
+      _openPushHref(initialHref);
+    }
+
+    _pushInitialized = true;
+  }
+
+  Future<void> _showForegroundPushNotification(RemoteMessage message) async {
+    final notification = message.notification;
+    final title = notification?.title ?? message.data['title']?.toString();
+    final body = notification?.body ?? message.data['body']?.toString();
+    final href =
+        message.data['href']?.toString() ?? defaultMobileAuthReturnPath;
+    if (title == null || title.trim().isEmpty) return;
+
+    await localNotifications.show(
+      message.hashCode,
+      title,
+      body,
+      const NotificationDetails(
+        android: AndroidNotificationDetails(
+          pushAlertsChannelId,
+          pushAlertsChannelName,
+          channelDescription: 'Native QuadPulse trading and account alerts.',
+          importance: Importance.high,
+          priority: Priority.high,
+        ),
+        iOS: DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+        ),
+      ),
+      payload: href,
+    );
+  }
+
+  Future<void> _registerPushTokenIfAuthenticated(WebUri? loadedUrl) async {
+    if (!_pushInitialized || _pushRegistrationInFlight) return;
+    final url = loadedUrl ?? await _controller?.getUrl();
+    if (url == null || !_isAuthenticatedAppUrl(url)) return;
+
+    _pushRegistrationInFlight = true;
+    try {
+      final settings = await FirebaseMessaging.instance.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+      if (Platform.isAndroid) {
+        await Permission.notification.request();
+      }
+
+      final token = await FirebaseMessaging.instance.getToken();
+      if (token == null || token.isEmpty) return;
+      await _registerPushTokenWithWebSession(
+        token,
+        permissionStatus:
+            _authorizationStatusName(settings.authorizationStatus),
+      );
+    } finally {
+      _pushRegistrationInFlight = false;
+    }
+  }
+
+  Future<void> _registerPushTokenWithWebSession(
+    String token, {
+    String permissionStatus = 'unknown',
+  }) async {
+    final controller = _controller;
+    if (controller == null || token.isEmpty) return;
+
+    final deviceId = await _pushDeviceId();
+    final appVersion = await _appVersion();
+    final script = '''
+      fetch('/api/mobile/push/register', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {'Content-Type': 'application/json'},
+        body: ${jsonEncode(jsonEncode({
+          'platform': Platform.isAndroid ? 'android' : 'ios',
+          'deviceId': deviceId,
+          'appVersion': appVersion,
+          'token': token,
+          'permissionStatus': permissionStatus,
+        }))}
+      }).then(function (res) {
+        return res.ok;
+      }).catch(function () {
+        return false;
+      });
+    ''';
+    final result = await controller.evaluateJavascript(source: script);
+    if (result == true || result == 'true') {
+      _lastRegisteredPushToken = token;
+    }
+  }
+
+  Future<void> _unregisterPushTokenWithWebSession() async {
+    final controller = _controller;
+    if (controller == null) return;
+
+    final token = _lastRegisteredPushToken ??
+        (firebaseMessagingAvailable
+            ? await FirebaseMessaging.instance
+                .getToken()
+                .catchError((_) => null)
+            : null);
+    final deviceId = await _pushDeviceId();
+    final script = '''
+      fetch('/api/mobile/push/unregister', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {'Content-Type': 'application/json'},
+        body: ${jsonEncode(jsonEncode({
+          'deviceId': deviceId,
+          if (token != null && token.isNotEmpty) 'token': token,
+        }))}
+      }).catch(function () {
+        return false;
+      });
+    ''';
+    await controller.evaluateJavascript(source: script);
+    _lastRegisteredPushToken = null;
+  }
+
+  Future<String> _pushDeviceId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final existing = prefs.getString(pushDeviceIdKey);
+    if (existing != null && existing.isNotEmpty) return existing;
+
+    final random = Random.secure();
+    final bytes = List<int>.generate(18, (_) => random.nextInt(256));
+    final deviceId = base64UrlEncode(bytes).replaceAll('=', '');
+    await prefs.setString(pushDeviceIdKey, deviceId);
+    return deviceId;
+  }
+
+  Future<String> _appVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      return '${info.version}+${info.buildNumber}';
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
+  String _authorizationStatusName(AuthorizationStatus status) {
+    switch (status) {
+      case AuthorizationStatus.authorized:
+        return 'authorized';
+      case AuthorizationStatus.denied:
+        return 'denied';
+      case AuthorizationStatus.provisional:
+        return 'provisional';
+      case AuthorizationStatus.notDetermined:
+        return 'notDetermined';
+    }
+  }
+
   void _openDeepLink(Uri uri) {
     final webUri = WebUri.uri(uri);
     if (_isMobileAuthCompleteUri(uri)) {
+      final tokenLength = uri.queryParameters['token']?.length ?? 0;
+      debugPrint(
+        'QuadPulse auth handoff: deep link received '
+        '(${uri.scheme}://${uri.host}${uri.path}, token length $tokenLength)',
+      );
       _closeAuthSurfaces();
       _pendingDeepLink = _webUrlFromMobileAuthComplete(uri);
       _loadPendingDeepLink();
@@ -414,6 +708,13 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
 
   Future<void> _loadInMainWebView(WebUri url) async {
     final canonicalUrl = _canonicalQuadPulseWebUrl(url);
+    if (_isMobileAuthConsumeUrl(canonicalUrl)) {
+      _pendingConsumeCookieCheckUrl = canonicalUrl;
+      debugPrint(
+        'QuadPulse auth handoff: loading consume URL in WebView '
+        '${_redactedAuthUrl(canonicalUrl)}',
+      );
+    }
     await _controller?.loadUrl(urlRequest: URLRequest(url: canonicalUrl));
   }
 
@@ -480,6 +781,43 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
         (uri.path == '/complete' || uri.path.isEmpty);
   }
 
+  bool _isMobileAuthConsumeUrl(WebUri url) {
+    return _isQuadPulseUrl(url) && url.path == '/auth/mobile/consume';
+  }
+
+  bool _isAuthenticatedAppUrl(WebUri url) {
+    if (!_isQuadPulseUrl(url)) return false;
+    final path = url.path.toLowerCase();
+    return path == '/dashboard' || path.startsWith('/dashboard/');
+  }
+
+  bool _isLogoutUrl(WebUri url) {
+    if (!_isQuadPulseUrl(url)) return false;
+    final path = url.path.toLowerCase();
+    return path == '/api/auth/logout' ||
+        path == '/api/auth/signout' ||
+        path == '/auth/logout' ||
+        path == '/logout';
+  }
+
+  void _openPushHref(String? href) {
+    final cleaned = href?.trim();
+    if (cleaned == null || cleaned.isEmpty) return;
+
+    final uri = _safeQuadPulseReturnUri(cleaned);
+    if (uri == null) return;
+    final destination = WebUri.uri(
+      quadPulseBaseUri.replace(
+        path: uri.path.isEmpty ? defaultMobileAuthReturnPath : uri.path,
+        query: uri.hasQuery ? uri.query : null,
+        fragment: uri.hasFragment ? uri.fragment : null,
+      ),
+    );
+
+    _pendingDeepLink = destination;
+    _loadPendingDeepLink();
+  }
+
   WebUri _webUrlFromMobileAuthComplete(Uri uri) {
     final urlValue = uri.queryParameters['url'];
     if (urlValue != null) {
@@ -489,16 +827,31 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
 
     final token = uri.queryParameters['token'];
     if (token != null && token.isNotEmpty) {
-      return WebUri(
-        'https://quadpulse.io/auth/mobile/consume?token=${Uri.encodeQueryComponent(token)}',
+      debugPrint(
+        'QuadPulse auth handoff: token received (${token.length} chars)',
       );
+      return _mobileAuthConsumeUrl(token);
     }
 
     return quadPulseHomeUrl;
   }
 
+  WebUri _mobileAuthConsumeUrl(String token) {
+    return WebUri.uri(
+      quadPulseBaseUri.replace(
+        path: '/auth/mobile/consume',
+        queryParameters: {
+          'token': token,
+          'qp_native': '1',
+          'qp_native_platform': Platform.isAndroid ? 'android' : 'ios',
+        },
+      ),
+    );
+  }
+
   Future<void> _openSystemAuthSession(WebUri url) async {
     final authUrl = _systemAuthSessionUrl(url);
+    debugPrint('QuadPulse auth handoff: opening external auth URL $authUrl');
 
     if (Platform.isIOS && await WebAuthenticationSession.isAvailable()) {
       await _openIosWebAuthenticationSession(authUrl);
@@ -568,8 +921,8 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
     if (uri == null) return url;
 
     final originalCallback = uri.queryParameters['callbackUrl'];
-    final returnUrl = _safeQuadPulseDashboardReturnUrl(originalCallback);
-    final mobileCallback = Uri.parse(mobileAuthCompleteUrl.toString())
+    final returnUrl = _safeQuadPulseDashboardReturnPath(originalCallback);
+    final mobileCallback = Uri(path: mobileAuthCompleteUrl.path)
         .replace(queryParameters: {'returnUrl': returnUrl}).toString();
 
     final query = Map<String, String>.from(uri.queryParameters)
@@ -578,21 +931,23 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
       ..['qp_native_platform'] = Platform.isIOS ? 'ios' : 'android'
       ..['callbackUrl'] = mobileCallback;
 
-    return WebUri.uri(uri.replace(queryParameters: query));
+    return WebUri.uri(
+      quadPulseBaseUri.replace(path: '/auth/signin', queryParameters: query),
+    );
   }
 
-  String _safeQuadPulseDashboardReturnUrl(String? value) {
+  String _safeQuadPulseDashboardReturnPath(String? value) {
     final mobileReturnUrl = _returnUrlFromMobileAuthCallback(value);
-    final url = _safeQuadPulseReturnUrl(mobileReturnUrl ?? value);
-    final uri = Uri.tryParse(url);
-    if (uri == null) return quadPulseHomeUrl.toString();
+    final uri = _safeQuadPulseReturnUri(mobileReturnUrl ?? value);
+    if (uri == null) return defaultMobileAuthReturnPath;
 
     final path = uri.path.toLowerCase();
-    if (path.startsWith('/auth/') || path.startsWith('/api/auth/')) {
-      return quadPulseHomeUrl.toString();
+    if (path == defaultMobileAuthReturnPath ||
+        path.startsWith('$defaultMobileAuthReturnPath/')) {
+      return uri.toString();
     }
 
-    return url;
+    return defaultMobileAuthReturnPath;
   }
 
   String? _returnUrlFromMobileAuthCallback(String? value) {
@@ -613,29 +968,72 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
     return returnUrl == null || returnUrl.isEmpty ? null : returnUrl;
   }
 
-  String _safeQuadPulseReturnUrl(String? value) {
+  Uri? _safeQuadPulseReturnUri(String? value) {
     final cleaned = value?.trim();
     if (cleaned == null || cleaned.isEmpty) {
-      return quadPulseHomeUrl.toString();
+      return Uri.parse(defaultMobileAuthReturnPath);
     }
 
     final uri = Uri.tryParse(cleaned);
-    if (uri == null) return quadPulseHomeUrl.toString();
+    if (uri == null) return Uri.parse(defaultMobileAuthReturnPath);
 
     if (cleaned.startsWith('/') && !cleaned.startsWith('//')) {
-      return _quadPulseUrlFromPath(uri).toString();
+      return uri;
     }
 
     final parsed = WebUri.uri(uri);
     if (_isQuadPulseUrl(parsed)) {
-      return uri.toString();
+      return Uri(
+        path: uri.path.isEmpty ? '/' : uri.path,
+        query: uri.hasQuery ? uri.query : null,
+        fragment: uri.hasFragment ? uri.fragment : null,
+      );
     }
 
     if (_isLocalhostUri(uri)) {
-      return _quadPulseUrlFromPath(uri).toString();
+      return Uri(
+        path: uri.path.isEmpty ? '/' : uri.path,
+        query: uri.hasQuery ? uri.query : null,
+        fragment: uri.hasFragment ? uri.fragment : null,
+      );
     }
 
-    return quadPulseHomeUrl.toString();
+    return Uri.parse(defaultMobileAuthReturnPath);
+  }
+
+  Future<void> _maybeLogAuthConsumeResult(
+    InAppWebViewController controller,
+    WebUri? loadedUrl,
+  ) async {
+    final consumeUrl = _pendingConsumeCookieCheckUrl;
+    if (consumeUrl == null) return;
+
+    _pendingConsumeCookieCheckUrl = null;
+
+    try {
+      final cookies = await CookieManager.instance().getCookies(
+        url: quadPulseCookieUrl,
+        webViewController: controller,
+      );
+      final finalUrl = loadedUrl ?? await controller.getUrl();
+      debugPrint(
+        'QuadPulse auth handoff: consume completed; '
+        'cookies for quadpulse.io=${cookies.length}; final URL=$finalUrl',
+      );
+    } catch (error) {
+      debugPrint('QuadPulse auth handoff: cookie check failed: $error');
+    }
+  }
+
+  String _redactedAuthUrl(WebUri url) {
+    final uri = Uri.tryParse(url.toString());
+    if (uri == null || !uri.queryParameters.containsKey('token')) {
+      return url.toString();
+    }
+
+    final queryParameters = Map<String, String>.from(uri.queryParameters)
+      ..['token'] = 'REDACTED';
+    return uri.replace(queryParameters: queryParameters).toString();
   }
 
   bool _isLocalhostUri(Uri uri) {

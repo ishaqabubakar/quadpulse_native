@@ -22,7 +22,9 @@ ios/Flutter/flutter_export_environment.sh
 ios/Flutter/ephemeral/
 ios/Pods/
 ios/Runner.xcworkspace/xcuserdata/
+ios/Runner.xcworkspace/xcshareddata/swiftpm/
 ios/Runner.xcodeproj/xcuserdata/
+ios/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
 
 # IDE and OS
 .DS_Store
