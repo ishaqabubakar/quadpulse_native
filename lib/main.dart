@@ -82,6 +82,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
 
   InAppWebViewController? _controller;
   StreamSubscription<Uri>? _linkSubscription;
+  WebAuthenticationSession? _authSession;
   WebUri? _pendingDeepLink;
   int? _popupWindowId;
   DateTime? _lastBackPressAt;
@@ -97,6 +98,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
   void dispose() {
     _linkSubscription?.cancel();
     _authBrowser.dispose();
+    _authSession?.dispose();
     super.dispose();
   }
 
@@ -177,8 +179,8 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                     if (url == null) {
                       return NavigationActionPolicy.ALLOW;
                     }
-                    if (_shouldOpenInSecureAuthBrowser(url)) {
-                      await _openSecureAuthBrowser(url);
+                    if (_shouldOpenInSystemAuthSession(url)) {
+                      await _openSystemAuthSession(url);
                       return NavigationActionPolicy.CANCEL;
                     }
                     if (!_shouldOpenExternally(url)) {
@@ -190,8 +192,8 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                   },
                   onCreateWindow: (controller, createWindowAction) async {
                     final url = createWindowAction.request.url;
-                    if (url != null && _shouldOpenInSecureAuthBrowser(url)) {
-                      await _openSecureAuthBrowser(url);
+                    if (url != null && _shouldOpenInSystemAuthSession(url)) {
+                      await _openSystemAuthSession(url);
                       return false;
                     }
                     if (url != null && _shouldOpenExternally(url)) {
@@ -260,15 +262,15 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                             if (url == null) {
                               return NavigationActionPolicy.ALLOW;
                             }
-                            if (_isQuadPulseUrl(url)) {
-                              await _loadInMainWebView(url);
+                            if (_shouldOpenInSystemAuthSession(url)) {
+                              await _openSystemAuthSession(url);
                               if (mounted) {
                                 setState(() => _popupWindowId = null);
                               }
                               return NavigationActionPolicy.CANCEL;
                             }
-                            if (_shouldOpenInSecureAuthBrowser(url)) {
-                              await _openSecureAuthBrowser(url);
+                            if (_isQuadPulseUrl(url)) {
+                              await _loadInMainWebView(url);
                               if (mounted) {
                                 setState(() => _popupWindowId = null);
                               }
@@ -341,7 +343,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
   void _openDeepLink(Uri uri) {
     final webUri = WebUri.uri(uri);
     if (_isMobileAuthCompleteUri(uri)) {
-      _authBrowser.close();
+      _closeAuthSurfaces();
       _pendingDeepLink = _webUrlFromMobileAuthComplete(uri);
       _loadPendingDeepLink();
       return;
@@ -349,7 +351,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
 
     if (!_isQuadPulseUrl(webUri)) return;
 
-    _authBrowser.close();
+    _closeAuthSurfaces();
 
     _pendingDeepLink = webUri;
     _loadPendingDeepLink();
@@ -416,7 +418,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
         path.startsWith('/api/auth/signin/');
   }
 
-  bool _shouldOpenInSecureAuthBrowser(WebUri url) {
+  bool _shouldOpenInSystemAuthSession(WebUri url) {
     return _isAuthEntryUrl(url) || _isGoogleAuthUrl(url);
   }
 
@@ -443,8 +445,13 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
     return quadPulseHomeUrl;
   }
 
-  Future<void> _openSecureAuthBrowser(WebUri url) async {
-    final authUrl = _secureAuthBrowserUrl(url);
+  Future<void> _openSystemAuthSession(WebUri url) async {
+    final authUrl = _systemAuthSessionUrl(url);
+
+    if (Platform.isIOS && await WebAuthenticationSession.isAvailable()) {
+      await _openIosWebAuthenticationSession(authUrl);
+      return;
+    }
 
     if (_authBrowser.isOpened()) {
       await _authBrowser.close();
@@ -465,7 +472,44 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
     await launchUrl(authUrl, mode: LaunchMode.externalApplication);
   }
 
-  WebUri _secureAuthBrowserUrl(WebUri url) {
+  Future<void> _openIosWebAuthenticationSession(WebUri url) async {
+    await _authSession?.cancel();
+    await _authSession?.dispose();
+
+    final session = await WebAuthenticationSession.create(
+      url: url,
+      callbackURLScheme: 'quadpulse',
+      initialSettings: WebAuthenticationSessionSettings(
+        prefersEphemeralWebBrowserSession: false,
+      ),
+      onComplete: (callbackUrl, error) async {
+        final completedUri =
+            callbackUrl == null ? null : Uri.tryParse(callbackUrl.toString());
+        if (completedUri != null) {
+          _openDeepLink(completedUri);
+        }
+        await _authSession?.dispose();
+        _authSession = null;
+      },
+    );
+
+    _authSession = session;
+
+    if (!await session.canStart() || !await session.start()) {
+      await session.dispose();
+      _authSession = null;
+      await launchUrl(url, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  void _closeAuthSurfaces() {
+    _authBrowser.close();
+    _authSession?.cancel();
+    _authSession?.dispose();
+    _authSession = null;
+  }
+
+  WebUri _systemAuthSessionUrl(WebUri url) {
     if (!_isAuthEntryUrl(url)) return url;
 
     final uri = Uri.tryParse(url.toString());
