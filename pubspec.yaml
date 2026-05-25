@@ -1,0 +1,45 @@
+name: quadpulse_native
+description: QuadPulse native mobile wrapper for Android and iOS.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  app_links: ^7.0.0
+  flutter:
+    sdk: flutter
+  flutter_inappwebview: ^6.1.5
+  permission_handler: ^12.0.1
+  url_launcher: ^6.3.1
+
+dev_dependencies:
+  flutter_launcher_icons: ^0.14.3
+  flutter_lints: ^5.0.0
+  flutter_native_splash: ^2.4.3
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/brand/quadpulse-icon.png
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/brand/quadpulse-icon-opaque.png
+  adaptive_icon_background: "#000000"
+  adaptive_icon_foreground: assets/brand/quadpulse-icon.png
+  remove_alpha_ios: true
+
+flutter_native_splash:
+  color: "#000000"
+  image: assets/brand/quadpulse-icon-opaque.png
+  android_12:
+    color: "#000000"
+    image: assets/brand/quadpulse-icon-opaque.png
+  ios: true
+  android: true
+  web: false
