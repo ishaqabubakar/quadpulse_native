@@ -172,13 +172,27 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                       setState(() => _progress = progress / 100);
                     }
                   },
+                  onLoadStart: (controller, url) async {
+                    if (url == null) return;
+
+                    final canonicalUrl = _canonicalQuadPulseWebUrl(url);
+                    if (canonicalUrl.toString() == url.toString()) return;
+
+                    await controller.stopLoading();
+                    await _loadInMainWebView(canonicalUrl);
+                  },
                   onLoadStop: (_, __) {
                     if (mounted) setState(() => _progress = 1);
                   },
-                  shouldOverrideUrlLoading: (_, navigationAction) async {
-                    final url = navigationAction.request.url;
-                    if (url == null) {
+                  shouldOverrideUrlLoading: (controller, navigationAction) async {
+                    final requestedUrl = navigationAction.request.url;
+                    if (requestedUrl == null) {
                       return NavigationActionPolicy.ALLOW;
+                    }
+                    final url = _canonicalQuadPulseWebUrl(requestedUrl);
+                    if (url.toString() != requestedUrl.toString()) {
+                      await controller.loadUrl(urlRequest: URLRequest(url: url));
+                      return NavigationActionPolicy.CANCEL;
                     }
                     if (_shouldOpenInSystemAuthSession(url)) {
                       await _openSystemAuthSession(url);
@@ -192,7 +206,16 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                     return NavigationActionPolicy.CANCEL;
                   },
                   onCreateWindow: (controller, createWindowAction) async {
-                    final url = createWindowAction.request.url;
+                    final requestedUrl = createWindowAction.request.url;
+                    final url = requestedUrl == null
+                        ? null
+                        : _canonicalQuadPulseWebUrl(requestedUrl);
+                    if (requestedUrl != null &&
+                        url != null &&
+                        url.toString() != requestedUrl.toString()) {
+                      await _loadInMainWebView(url);
+                      return false;
+                    }
                     if (url != null && _shouldOpenInSystemAuthSession(url)) {
                       await _openSystemAuthSession(url);
                       return false;
@@ -258,10 +281,18 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                           },
                           onLoadStart: (_, url) => _handlePopupReturn(url),
                           shouldOverrideUrlLoading:
-                              (_, navigationAction) async {
-                            final url = navigationAction.request.url;
-                            if (url == null) {
+                              (controller, navigationAction) async {
+                            final requestedUrl = navigationAction.request.url;
+                            if (requestedUrl == null) {
                               return NavigationActionPolicy.ALLOW;
+                            }
+                            final url = _canonicalQuadPulseWebUrl(requestedUrl);
+                            if (url.toString() != requestedUrl.toString()) {
+                              await _loadInMainWebView(url);
+                              if (mounted) {
+                                setState(() => _popupWindowId = null);
+                              }
+                              return NavigationActionPolicy.CANCEL;
                             }
                             if (_shouldOpenInSystemAuthSession(url)) {
                               await _openSystemAuthSession(url);
@@ -368,21 +399,39 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
   }
 
   Future<void> _handlePopupReturn(WebUri? url) async {
-    if (url == null || !_isQuadPulseUrl(url)) return;
+    if (url == null) return;
 
-    await _loadInMainWebView(url);
+    final canonicalUrl = _canonicalQuadPulseWebUrl(url);
+    if (!_isQuadPulseUrl(canonicalUrl)) return;
+
+    await _loadInMainWebView(canonicalUrl);
     if (mounted) {
       setState(() => _popupWindowId = null);
     }
   }
 
   Future<void> _loadInMainWebView(WebUri url) async {
-    await _controller?.loadUrl(urlRequest: URLRequest(url: url));
+    final canonicalUrl = _canonicalQuadPulseWebUrl(url);
+    await _controller?.loadUrl(urlRequest: URLRequest(url: canonicalUrl));
   }
 
   bool _isQuadPulseUrl(WebUri url) {
     final host = url.host.toLowerCase();
     return url.scheme == 'https' && inAppHosts.contains(host);
+  }
+
+  WebUri _canonicalQuadPulseWebUrl(WebUri url) {
+    if (_isQuadPulseUrl(url)) return url;
+
+    final uri = Uri.tryParse(url.toString());
+    if (uri == null) return url;
+
+    final scheme = uri.scheme.toLowerCase();
+    if ((scheme == 'http' || scheme == 'https') && _isLocalhostUri(uri)) {
+      return WebUri.uri(_quadPulseUrlFromPath(uri));
+    }
+
+    return url;
   }
 
   bool _shouldOpenExternally(WebUri url) {
