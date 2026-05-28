@@ -27,6 +27,7 @@ const String pushDeviceIdKey = 'quadpulse.push.device_id';
 const String pushAlertsChannelId = 'quadpulse_alerts';
 const String pushAlertsChannelName = 'QuadPulse alerts';
 const Set<String> inAppHosts = {'quadpulse.io', 'www.quadpulse.io'};
+const Set<String> externalArticlePaths = {'/press-blog/', '/news/'};
 const Set<String> externalHosts = {
   'facebook.com',
   'www.facebook.com',
@@ -118,6 +119,7 @@ class QuadPulseWebShell extends StatefulWidget {
 class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
   final AppLinks _appLinks = AppLinks();
   final ChromeSafariBrowser _authBrowser = ChromeSafariBrowser();
+  final ChromeSafariBrowser _articleBrowser = ChromeSafariBrowser();
 
   InAppWebViewController? _controller;
   StreamSubscription<Uri>? _linkSubscription;
@@ -148,6 +150,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
     _foregroundPushSubscription?.cancel();
     _pushOpenSubscription?.cancel();
     _authBrowser.dispose();
+    _articleBrowser.dispose();
     _authSession?.dispose();
     super.dispose();
   }
@@ -203,6 +206,16 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                   initialSettings: _mainWebViewSettings(),
                   onWebViewCreated: (controller) {
                     _controller = controller;
+                    controller.addJavaScriptHandler(
+                      handlerName: 'openExternalBrowser',
+                      callback: (arguments) async {
+                        final href = arguments.isEmpty
+                            ? null
+                            : arguments.first?.toString();
+                        await _openExternalHref(href);
+                        return true;
+                      },
+                    );
                     _loadPendingDeepLink();
                   },
                   onProgressChanged: (_, progress) {
@@ -247,7 +260,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                       return NavigationActionPolicy.ALLOW;
                     }
 
-                    await launchUrl(url, mode: LaunchMode.externalApplication);
+                    await _openExternalUrl(url);
                     return NavigationActionPolicy.CANCEL;
                   },
                   onCreateWindow: (controller, createWindowAction) async {
@@ -266,8 +279,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                       return false;
                     }
                     if (url != null && _shouldOpenExternally(url)) {
-                      await launchUrl(url,
-                          mode: LaunchMode.externalApplication);
+                      await _openExternalUrl(url);
                       return false;
                     }
 
@@ -347,10 +359,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
                               return NavigationActionPolicy.CANCEL;
                             }
                             if (_shouldOpenExternally(url)) {
-                              await launchUrl(
-                                url,
-                                mode: LaunchMode.externalApplication,
-                              );
+                              await _openExternalUrl(url);
                               return NavigationActionPolicy.CANCEL;
                             }
                             return NavigationActionPolicy.ALLOW;
@@ -745,7 +754,7 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
 
     final host = url.host.toLowerCase();
     if (inAppHosts.contains(host)) {
-      return false;
+      return _isExternalArticleUrl(url);
     }
     if (_looksLikeAuthFlow(url)) {
       return false;
@@ -754,6 +763,12 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
     return externalHosts.any((externalHost) {
       return host == externalHost || host.endsWith('.$externalHost');
     });
+  }
+
+  bool _isExternalArticleUrl(WebUri url) {
+    if (!_isQuadPulseUrl(url)) return false;
+    final path = url.path.toLowerCase();
+    return externalArticlePaths.any(path.startsWith);
   }
 
   bool _isGoogleAuthUrl(WebUri url) {
@@ -813,9 +828,51 @@ class _QuadPulseWebShellState extends State<QuadPulseWebShell> {
         fragment: uri.hasFragment ? uri.fragment : null,
       ),
     );
+    if (_shouldOpenExternally(destination)) {
+      unawaited(_openExternalUrl(destination));
+      return;
+    }
 
     _pendingDeepLink = destination;
     _loadPendingDeepLink();
+  }
+
+  Future<void> _openExternalHref(String? href) async {
+    final cleaned = href?.trim();
+    if (cleaned == null || cleaned.isEmpty) return;
+
+    final uri = Uri.tryParse(cleaned);
+    if (uri == null) return;
+
+    final url = WebUri.uri(
+      cleaned.startsWith('/') && !cleaned.startsWith('//')
+          ? quadPulseBaseUri.replace(
+              path: uri.path.isEmpty ? '/' : uri.path,
+              query: uri.hasQuery ? uri.query : null,
+              fragment: uri.hasFragment ? uri.fragment : null,
+            )
+          : uri,
+    );
+    await _openExternalUrl(_canonicalQuadPulseWebUrl(url));
+  }
+
+  Future<void> _openExternalUrl(WebUri url) async {
+    if (_isExternalArticleUrl(url) && await ChromeSafariBrowser.isAvailable()) {
+      if (_articleBrowser.isOpened()) {
+        await _articleBrowser.close();
+      }
+      await _articleBrowser.open(
+        url: url,
+        settings: ChromeSafariBrowserSettings(
+          dismissButtonStyle: DismissButtonStyle.CLOSE,
+          presentationStyle: ModalPresentationStyle.PAGE_SHEET,
+          shareState: CustomTabsShareState.SHARE_STATE_ON,
+        ),
+      );
+      return;
+    }
+
+    await launchUrl(url, mode: LaunchMode.externalApplication);
   }
 
   WebUri _webUrlFromMobileAuthComplete(Uri uri) {
